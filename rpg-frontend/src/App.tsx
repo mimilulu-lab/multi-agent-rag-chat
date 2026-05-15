@@ -110,6 +110,9 @@ function App() {
       }
     }
     fetchAgents()
+    // 监听 AgentConfigPage 保存后触发的更新事件
+    window.addEventListener('agentUpdated', fetchAgents)
+    return () => window.removeEventListener('agentUpdated', fetchAgents)
   }, [currentPage])
 
   // 加载历史会话列表

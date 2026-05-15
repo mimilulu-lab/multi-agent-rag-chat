@@ -36,7 +36,7 @@ async def get_manager_config():
 @router.put("")
 async def update_manager_config(request: UpdateManagerRequest):
     """更新 Manager 配置"""
-    update_data = {k: v for k, v in request.model_dump().items() if v is not None}
+    update_data = request.model_dump(exclude_none=True)  # exclude_none 仅排除 None，保留 False/空字符串
     config = manager_config_manager.update_config(update_data)
 
     return {
@@ -47,6 +47,7 @@ async def update_manager_config(request: UpdateManagerRequest):
         "avatar_type": config.avatar_type,
         "agent_type": "manager",
         "provider_id": config.provider_id,
+        "kb_id": config.kb_id,
         "is_active": config.is_active,
     }
 

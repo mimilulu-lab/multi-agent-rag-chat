@@ -8,6 +8,7 @@ from .provider import Provider, ModelInfo, ProviderInfo
 from .dashscope_provider import DashScopeProvider
 from .anthropic_provider import AnthropicProvider
 from .kimi_provider import KimiProvider
+from .openai_compatible_provider import OpenAICompatibleProvider
 from .provider_manager import ProviderManager, ProviderType, provider_manager
 
 
@@ -64,6 +65,7 @@ __all__ = [
     "DashScopeProvider",
     "AnthropicProvider",
     "KimiProvider",
+    "OpenAICompatibleProvider",
     "ProviderManager",
     "ProviderType",
     "provider_manager",

@@ -5,6 +5,7 @@ FastAPI 后端 - MsgHub 多 Agent RPG 系统
 """
 import os
 import sys
+import uuid
 import asyncio
 import traceback
 from contextlib import asynccontextmanager
@@ -59,7 +60,7 @@ parser.add_argument(
     action="store_true",
     help="构建前端后启动（生产模式）"
 )
-args = parser.parse_args()
+args, _ = parser.parse_known_args()  # parse_known_args 忽略 uvicorn 等未知参数，避免直接启动时崩溃
 
 # 默认生产模式（构建前端）
 DEV_MODE = args.dev
@@ -140,7 +141,7 @@ def _persist_chat_message(
     store.append_message(
         conversation_id,
         ChatMessageRecord(
-            id=f"msg_{int(time.time() * 1000)}",
+            id=f"msg_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}",
             role=role,
             content=content,
             timestamp=time.time(),
@@ -639,7 +640,7 @@ async def chat_stream(request: ChatRequest):
             if request.agent_id and request.agent_id != "manager_default":
                 worker = None
                 for w in system_state.get("workers", []):
-                    if w.name == request.agent_id or getattr(w, 'id', None) == request.agent_id:
+                    if getattr(w, 'id', None) == request.agent_id:
                         worker = w
                         break
 

@@ -177,7 +177,9 @@ export const ProviderConfigPage = () => {
   }
 
   const handleSave = async () => {
-    if (!formData.name || !formData.api_key || !formData.model_id) {
+    const isEditing = !!editingProvider
+    // 编辑模式下 api_key 可留空（表示不修改）
+    if (!formData.name || (!isEditing && !formData.api_key) || !formData.model_id) {
       alert('请填写所有必填字段')
       return
     }

@@ -44,32 +44,30 @@ class ConversationStore:
         self._load()
 
     def _load(self):
-        """从文件加载会话数据"""
+        """从文件加载会话数据（调用方不持有锁）"""
         if not self.persist_path.exists():
             return
 
         try:
-            with self._lock:
-                with open(self.persist_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+            with open(self.persist_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
 
-                for item in data:
-                    conv = Conversation(**item)
-                    self._conversations[conv.conversation_id] = conv
+            for item in data:
+                conv = Conversation(**item)
+                self._conversations[conv.conversation_id] = conv
 
-                self._cleanup_expired()
+            self._cleanup_expired()
         except Exception as e:
             print(f"⚠️ 加载会话数据失败: {e}")
             self._conversations = {}
 
     def _save(self):
-        """保存会话数据到文件"""
+        """保存会话数据到文件（调用方已持有锁，此处不再加锁）"""
         try:
-            with self._lock:
-                self._cleanup_expired()
-                data = [conv.model_dump() for conv in self._conversations.values()]
-                with open(self.persist_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+            self._cleanup_expired()
+            data = [conv.model_dump() for conv in self._conversations.values()]
+            with open(self.persist_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"⚠️ 保存会话数据失败: {e}")
 

@@ -199,7 +199,7 @@ export interface ProviderModel {
 export interface ProviderInfo {
   id: string
   name: string
-  provider_type: 'dashscope' | 'anthropic'
+  provider_type: ProviderType
   base_url: string
   api_key: string
   model_id: string

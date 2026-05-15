@@ -12,6 +12,7 @@ from .provider import Provider, ProviderInfo
 from .dashscope_provider import DashScopeProvider
 from .anthropic_provider import AnthropicProvider
 from .kimi_provider import KimiProvider
+from .openai_compatible_provider import OpenAICompatibleProvider
 
 
 
@@ -28,6 +29,8 @@ class ProviderType(str, Enum):
     DASHSCOPE = "dashscope"
     ANTHROPIC = "anthropic"
     KIMI = "kimi"
+    OPENAI = "openai"
+    CUSTOM = "custom"
 
 
 class ProviderConfig(BaseModel):
@@ -136,6 +139,17 @@ class ProviderManager:
                     model_name=config.model_name,
                     is_active=config.is_active,
                 )
+            elif config.provider_type in (ProviderType.OPENAI, ProviderType.CUSTOM):
+                return OpenAICompatibleProvider(
+                    id=config.id,
+                    name=config.name,
+                    provider_type=config.provider_type,
+                    api_key=config.api_key,
+                    base_url=config.base_url,
+                    model_id=config.model_id,
+                    model_name=config.model_name,
+                    is_active=config.is_active,
+                )
         except Exception as e:
             print(f"⚠️ Failed to create provider {config.id}: {e}")
         return None
@@ -228,6 +242,16 @@ class ProviderManager:
             provider = KimiProvider(
                 id=provider_id,
                 name=name,
+                api_key=provider_data.get("api_key", ""),
+                base_url=provider_data.get("base_url", ""),
+                model_id=model_id,
+                model_name=model_name,
+            )
+        elif provider_type in (ProviderType.OPENAI, ProviderType.CUSTOM):
+            provider = OpenAICompatibleProvider(
+                id=provider_id,
+                name=name,
+                provider_type=str(provider_type),
                 api_key=provider_data.get("api_key", ""),
                 base_url=provider_data.get("base_url", ""),
                 model_id=model_id,

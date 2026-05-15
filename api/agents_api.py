@@ -74,60 +74,6 @@ async def create_agent(request: CreateAgentRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/{agent_id}")
-async def get_agent(agent_id: str):
-    """获取单个 Agent 配置"""
-    agent = agents_config_manager.get_agent(agent_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return agent.to_info(mask_secret=True)
-
-
-@router.put("/{agent_id}")
-async def update_agent(agent_id: str, request: UpdateAgentRequest):
-    """更新 Agent 配置"""
-    update_data = {k: v for k, v in request.model_dump().items() if v is not None}
-    agent = agents_config_manager.update_agent(agent_id, update_data)
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return agent.to_info(mask_secret=True)
-
-
-@router.delete("/{agent_id}")
-async def delete_agent(agent_id: str):
-    """删除 Agent"""
-    success = agents_config_manager.delete_agent(agent_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return {"success": True}
-
-
-@router.post("/{agent_id}/test")
-async def test_agent_connection(agent_id: str):
-    """测试 Agent 的模型连接"""
-    agent = agents_config_manager.get_agent(agent_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-
-    # 通过 provider_id 获取 Provider 信息
-    from providers import provider_manager
-    provider = provider_manager.get_provider(agent.provider_id)
-    if not provider:
-        raise HTTPException(status_code=400, detail=f"Provider {agent.provider_id} not found")
-
-    # 导入测试连接函数
-    from providers import test_model_connection
-
-    success, message = await test_model_connection(
-        provider_type=provider.provider_type,
-        api_key=provider.api_key,
-        model_id=provider.model_id,
-        base_url=provider.base_url if provider.base_url else None
-    )
-
-    return TestConnectionResponse(success=success, message=message)
-
-
 class TestConnectionRequest(BaseModel):
     """临时测试连接请求"""
     provider_type: str = Field(..., description="提供商类型: dashscope/anthropic/openai/custom")
@@ -135,6 +81,8 @@ class TestConnectionRequest(BaseModel):
     model_id: str = Field(..., description="模型ID")
     base_url: str = Field(default="", description="Base URL (可选)")
 
+
+# 注意：所有静态路径路由必须在 /{agent_id} 参数路由之前注册，否则会被参数路由优先匹配
 
 @router.post("/test-connection")
 async def test_connection_temp(request: TestConnectionRequest):
@@ -230,3 +178,55 @@ async def get_provider_models():
             "custom": custom_models,
         }
     }
+
+
+# ---- 参数路由（必须在所有静态路由之后）----
+
+@router.get("/{agent_id}")
+async def get_agent(agent_id: str):
+    """获取单个 Agent 配置"""
+    agent = agents_config_manager.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return agent.to_info(mask_secret=True)
+
+
+@router.put("/{agent_id}")
+async def update_agent(agent_id: str, request: UpdateAgentRequest):
+    """更新 Agent 配置"""
+    update_data = request.model_dump(exclude_none=True)
+    agent = agents_config_manager.update_agent(agent_id, update_data)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return agent.to_info(mask_secret=True)
+
+
+@router.delete("/{agent_id}")
+async def delete_agent(agent_id: str):
+    """删除 Agent"""
+    success = agents_config_manager.delete_agent(agent_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {"success": True}
+
+
+@router.post("/{agent_id}/test")
+async def test_agent_connection(agent_id: str):
+    """测试 Agent 的模型连接"""
+    agent = agents_config_manager.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    from providers import provider_manager
+    provider = provider_manager.get_provider(agent.provider_id)
+    if not provider:
+        raise HTTPException(status_code=400, detail=f"Provider {agent.provider_id} not found")
+
+    from providers import test_model_connection
+    success, message = await test_model_connection(
+        provider_type=provider.provider_type,
+        api_key=provider.api_key,
+        model_id=provider.model_id,
+        base_url=provider.base_url if provider.base_url else None
+    )
+    return TestConnectionResponse(success=success, message=message)
