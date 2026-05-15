@@ -2,6 +2,7 @@
 向量化模块 - 将文本转换为向量
 支持多种 Embedding API：Kimi、OpenAI、本地模型等
 """
+import hashlib
 import os
 from typing import List, Optional, Union
 import asyncio
@@ -198,10 +199,13 @@ class EmbeddingService:
             raise ValueError(f"不支持的提供商: {provider}")
 
         self.provider = provider_class(api_key=api_key, **kwargs)
+        self._cache: dict = {}  # MD5(text) → embedding vector
+        self._cache_hits = 0
+        self._cache_misses = 0
 
     async def embed(self, texts: Union[str, List[str]]) -> Union[List[float], List[List[float]]]:
         """
-        向量化文本
+        向量化文本（带缓存）
 
         Args:
             texts: 单个文本或文本列表
@@ -209,12 +213,36 @@ class EmbeddingService:
         Returns:
             单个向量或向量列表
         """
-        if isinstance(texts, str):
+        single = isinstance(texts, str)
+        if single:
             texts = [texts]
-            results = await self.provider.embed(texts)
+
+        results: List[Optional[List[float]]] = [None] * len(texts)
+        to_embed_indices: List[int] = []
+        to_embed_texts: List[str] = []
+
+        # 1. 检查缓存
+        for i, text in enumerate(texts):
+            cache_key = hashlib.md5(text.encode('utf-8')).hexdigest()
+            if cache_key in self._cache:
+                results[i] = self._cache[cache_key]
+                self._cache_hits += 1
+            else:
+                to_embed_indices.append(i)
+                to_embed_texts.append(text)
+                self._cache_misses += 1
+
+        # 2. 批量向量化未命中的文本
+        if to_embed_texts:
+            new_embeddings = await self.provider.embed(to_embed_texts)
+            for idx, (text_idx, text) in enumerate(zip(to_embed_indices, to_embed_texts)):
+                cache_key = hashlib.md5(text.encode('utf-8')).hexdigest()
+                self._cache[cache_key] = new_embeddings[idx]
+                results[text_idx] = new_embeddings[idx]
+
+        if single:
             return results[0]
-        else:
-            return await self.provider.embed(texts)
+        return results
 
     async def embed_chunks(self, chunks: List[TextChunk]) -> List[EmbeddingResult]:
         """向量化 TextChunk 列表"""
@@ -248,6 +276,23 @@ class EmbeddingService:
             self.compute_similarity(query_embedding, emb)
             for emb in embeddings
         ]
+
+    def cache_stats(self) -> dict:
+        """返回缓存统计信息"""
+        total = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total if total > 0 else 0
+        return {
+            "cached_vectors": len(self._cache),
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "hit_rate": round(hit_rate, 3),
+        }
+
+    def clear_cache(self):
+        """清空缓存"""
+        self._cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
 
 
 # 便捷函数

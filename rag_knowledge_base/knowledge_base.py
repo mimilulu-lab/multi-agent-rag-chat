@@ -1,17 +1,73 @@
 """
 知识库管理 - 整合文档处理全流程
-提供高层次的 RAG 接口
+提供高层次的 RAG 接口（支持 Hybrid Search + 轻量 Rerank）
 """
 import os
+import re
 import uuid
 from typing import List, Optional, Dict, Any, Union
 from pathlib import Path
 from dataclasses import dataclass, asdict
 
+try:
+    from rank_bm25 import BM25Okapi
+    _BM25_AVAILABLE = True
+except ImportError:
+    _BM25_AVAILABLE = False
+    print("⚠️ rank_bm25 未安装，Hybrid Search 将退化为纯向量检索")
+
 from .document_loader import DocumentLoader, Document
 from .text_splitter import RecursiveTextSplitter, TextChunk
 from .embeddings import EmbeddingService
 from .vector_store import VectorStore, SimpleVectorStore
+
+
+def _tokenize(text: str) -> List[str]:
+    """
+    简单分词：中文按字，英文按词，支持混合文本。
+    适用于 BM25 索引，无需外部依赖。
+    """
+    # 提取中文字符（单字）
+    cn_chars = re.findall(r'[一-鿿]', text)
+    # 提取英文单词（转小写）
+    en_words = re.findall(r'[a-zA-Z0-9]+', text.lower())
+    return cn_chars + en_words
+
+
+def _rrf_merge(
+    vector_results: List[Dict[str, Any]],
+    bm25_results: List[Dict[str, Any]],
+    top_k: int,
+    k: int = 60
+) -> List[Dict[str, Any]]:
+    """
+    Reciprocal Rank Fusion 合并向量检索和 BM25 检索结果。
+    score = Σ 1/(k + rank_i)
+    """
+    scores: Dict[str, float] = {}
+    content_map: Dict[str, Dict[str, Any]] = {}
+
+    for rank, result in enumerate(vector_results, 1):
+        doc_id = result["id"]
+        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank)
+        content_map[doc_id] = result
+
+    for rank, result in enumerate(bm25_results, 1):
+        doc_id = result["id"]
+        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank)
+        if doc_id not in content_map:
+            content_map[doc_id] = result
+
+    # 按 RRF 分数排序
+    sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)[:top_k]
+    merged = []
+    for rank, doc_id in enumerate(sorted_ids, 1):
+        item = dict(content_map[doc_id])
+        item["rrf_score"] = round(scores[doc_id], 6)
+        item["rank"] = rank
+        merged.append(item)
+
+    return merged
 
 
 @dataclass
@@ -83,6 +139,11 @@ class KnowledgeBase:
         self.metadata_path = self.persist_dir / f"{self.kb_id}_meta.json"
         self._save_metadata()
 
+        # BM25 索引（懒加载，首次 search 时构建）
+        self._bm25_index = None          # BM25Okapi 实例
+        self._bm25_corpus: List[Dict[str, Any]] = []  # [{id, content, metadata}]
+        self._bm25_dirty = True          # 标记：需要重建索引
+
         print(f"✅ 知识库创建成功: {self.kb_id}")
         print(f"   名称: {config.name}")
         print(f"   描述: {config.description}")
@@ -147,6 +208,9 @@ class KnowledgeBase:
             "doc_ids": doc_ids[:5] if len(doc_ids) > 5 else doc_ids,  # 只显示前5个
         }
 
+        # 标记 BM25 索引需要重建
+        self._bm25_dirty = True
+
         print(f"   ✅ 文档处理完成!")
         print(f"      - 原始文档: {result['documents']}")
         print(f"      - 文本块: {result['chunks']}")
@@ -182,11 +246,173 @@ class KnowledgeBase:
 
         return results
 
+    def _rebuild_bm25_index(self):
+        """从向量存储加载所有文档，重建 BM25 索引"""
+        if not _BM25_AVAILABLE:
+            return
+
+        try:
+            raw_docs = self.vector_store.get_documents(knowledge_base_id=self.kb_id)
+        except Exception as e:
+            print(f"   ⚠️ BM25 索引构建失败（获取文档出错）: {e}")
+            return
+
+        # get_documents 只返回按文件聚合的摘要，需要全量 chunks
+        # 从 vector_store 获取完整内容
+        try:
+            if hasattr(self.vector_store, 'collection'):
+                # ChromaDB
+                result = self.vector_store.collection.get(
+                    where={"knowledge_base_id": self.kb_id},
+                    include=["documents", "metadatas"]
+                )
+                self._bm25_corpus = [
+                    {
+                        "id": doc_id,
+                        "content": content,
+                        "metadata": meta,
+                        "tokens": _tokenize(content),
+                    }
+                    for doc_id, content, meta in zip(
+                        result["ids"],
+                        result["documents"],
+                        result["metadatas"]
+                    )
+                ]
+            elif hasattr(self.vector_store, 'documents'):
+                # SimpleVectorStore
+                self._bm25_corpus = [
+                    {
+                        "id": doc_id,
+                        "content": doc["text"],
+                        "metadata": doc.get("metadata", {}),
+                        "tokens": _tokenize(doc["text"]),
+                    }
+                    for doc_id, doc in self.vector_store.documents.items()
+                    if doc.get("metadata", {}).get("knowledge_base_id") == self.kb_id
+                ]
+            else:
+                self._bm25_corpus = []
+        except Exception as e:
+            print(f"   ⚠️ BM25 语料加载失败: {e}")
+            self._bm25_corpus = []
+            return
+
+        if not self._bm25_corpus:
+            return
+
+        tokenized = [doc["tokens"] for doc in self._bm25_corpus]
+        self._bm25_index = BM25Okapi(tokenized)
+        self._bm25_dirty = False
+        print(f"   📚 BM25 索引已构建，语料规模: {len(self._bm25_corpus)} chunks")
+
+    def _bm25_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """BM25 关键词检索"""
+        if not _BM25_AVAILABLE or not self._bm25_corpus:
+            return []
+
+        if self._bm25_dirty or self._bm25_index is None:
+            self._rebuild_bm25_index()
+
+        if not self._bm25_index:
+            return []
+
+        query_tokens = _tokenize(query)
+        if not query_tokens:
+            return []
+
+        scores = self._bm25_index.get_scores(query_tokens)
+
+        # 取 top_k 结果
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        results = []
+        for rank, idx in enumerate(top_indices, 1):
+            doc = self._bm25_corpus[idx]
+            bm25_score = float(scores[idx])
+            if bm25_score <= 0:
+                continue
+            results.append({
+                "id": doc["id"],
+                "content": doc["content"],
+                "metadata": doc["metadata"],
+                "similarity": round(bm25_score / (bm25_score + 1), 4),  # 归一化到 [0,1)
+                "rank": rank,
+                "bm25_score": round(bm25_score, 4),
+            })
+
+        return results
+
+    async def hybrid_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        min_similarity: float = 0.0,
+        alpha: float = 0.5,  # 0=纯BM25, 1=纯向量
+    ) -> List[Dict[str, Any]]:
+        """
+        混合检索：向量 + BM25，用 RRF 合并结果。
+
+        Args:
+            query: 查询文本
+            top_k: 最终返回数量
+            min_similarity: 向量检索最低分（BM25 不受此限制）
+            alpha: 预留参数（RRF 本身不用 alpha，但供未来加权使用）
+
+        Returns:
+            按 RRF 分数排序的结果列表
+        """
+        fetch_k = top_k * 2  # 各路多取一些，合并后裁剪
+
+        # 向量检索
+        vector_results = await self.search(query, fetch_k, min_similarity)
+
+        # BM25 检索
+        if _BM25_AVAILABLE:
+            bm25_results = self._bm25_search(query, fetch_k)
+        else:
+            bm25_results = []
+
+        # 若 BM25 不可用，直接返回向量结果
+        if not bm25_results:
+            return vector_results[:top_k]
+
+        # RRF 合并
+        merged = _rrf_merge(vector_results, bm25_results, top_k)
+        return merged
+
+    def _keyword_rerank(
+        self,
+        query: str,
+        results: List[Dict[str, Any]],
+        weight: float = 0.2
+    ) -> List[Dict[str, Any]]:
+        """
+        轻量关键词 Rerank：在原始 similarity 基础上，按关键词命中数加分。
+        无需额外 API 调用，延迟近零。
+        """
+        query_tokens = set(_tokenize(query))
+        if not query_tokens:
+            return results
+
+        reranked = []
+        for item in results:
+            content_tokens = set(_tokenize(item["content"]))
+            overlap = len(query_tokens & content_tokens) / max(len(query_tokens), 1)
+            # 加权融合
+            boosted = item["similarity"] * (1 - weight) + overlap * weight
+            new_item = dict(item)
+            new_item["rerank_score"] = round(boosted, 4)
+            reranked.append(new_item)
+
+        reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
+        return reranked
+
     async def query(
         self,
         question: str,
         top_k: int = 5,
-        min_similarity: float = 0.5
+        min_similarity: float = 0.5,
+        use_hybrid: bool = True,
     ) -> Dict[str, Any]:
         """
         查询知识库并生成上下文
@@ -199,10 +425,17 @@ class KnowledgeBase:
         Returns:
             包含上下文和搜索结果的字典
         """
-        # 1. 检索相关文档
-        results = await self.search(question, top_k, min_similarity)
+        # 1. 检索相关文档（hybrid 模式或纯向量）
+        if use_hybrid and _BM25_AVAILABLE:
+            results = await self.hybrid_search(question, top_k, min_similarity)
+        else:
+            results = await self.search(question, top_k, min_similarity)
 
-        # 2. 构建上下文
+        # 2. 轻量 Rerank（关键词加权）
+        if results:
+            results = self._keyword_rerank(question, results)
+
+        # 3. 构建上下文
         if results:
             context_parts = []
             for i, result in enumerate(results, 1):

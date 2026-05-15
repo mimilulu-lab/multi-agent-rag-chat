@@ -4,6 +4,7 @@
 """
 from typing import Optional, Dict, Any, List, Callable
 import json
+import uuid
 import asyncio
 import openai
 from agentscope.agent import AgentBase
@@ -113,17 +114,17 @@ class ManagerAgent(AgentBase):
         return self._openai_client
 
     def register_worker(self, worker: 'WorkerAgent'):
-        """注册Worker Agent"""
-        self._workers[worker.name] = worker
+        """注册Worker Agent（以 worker.id 为键）"""
+        self._workers[worker.id] = worker
         worker.set_manager(self)  # 告诉Worker谁是Manager
-        print(f"✅ Manager 注册 Worker: {worker.name} ({worker.specialty})")
+        print(f"✅ Manager 注册 Worker: {worker.name} (id={worker.id}, 专长={worker.specialty})")
 
     def get_worker_capabilities(self) -> str:
-        """获取所有Worker的能力描述"""
+        """获取所有Worker的能力描述（含 id，供任务规划时引用）"""
         capabilities = []
-        for name, worker in self._workers.items():
+        for wid, worker in self._workers.items():
             capabilities.append(
-                f"- {name}: {worker.specialty}\n  专长: {worker.expertise}"
+                f"- agent_id: {wid}, name: {worker.name}\n  专长: {worker.expertise}"
             )
         return "\n".join(capabilities)
 
@@ -205,17 +206,18 @@ class ManagerAgent(AgentBase):
 1. 如果请求简单，直接回复 "DIRECT"，不需要分派
 2. 如果需要多个步骤或不同专长，制定分派计划
 
-请以JSON格式回复：
+请以JSON格式回复（注意：agent_id 必须使用上面列出的 agent_id 值）：
 {{
     "need_dispatch": true/false,
     "reason": "为什么需要/不需要分派",
     "steps": [
         {{
             "step_id": 1,
-            "agent_name": "负责该步骤的Agent名称",
+            "agent_id": "上面列出的 agent_id",
+            "agent_name": "Agent显示名称（仅供参考）",
             "task": "具体任务描述",
             "input": "需要传递给Agent的输入",
-            "depends_on": []  // 依赖的步骤ID
+            "depends_on": []
         }}
     ]
 }}
@@ -226,15 +228,34 @@ class ManagerAgent(AgentBase):
             {"role": "user", "content": user_request}
         ]
 
-        content = await self._call_llm(messages)
+        # 最多重试 2 次
+        plan_data = None
+        for attempt in range(2):
+            content = await self._call_llm(messages)
+            print(f"\n🤔 [Manager] AI规划思考 (attempt {attempt+1}):\n{content[:500]}...")
+            try:
+                json_str = self._extract_json(content)
+                plan_data = json.loads(json_str)
+                break  # 解析成功，跳出重试循环
+            except Exception as e:
+                print(f"   ⚠️ JSON 解析失败 (attempt {attempt+1}): {e}")
+                if attempt == 0:
+                    # 第一次失败：追加明确提示后重试
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": "你的回复不是合法的JSON，请只输出纯JSON，不要加任何说明文字或markdown代码块。"
+                    })
+
+        if plan_data is None:
+            print(f"\n⚠️ [Manager] 计划解析彻底失败，将直接处理")
+            return TaskPlan(
+                task_id=f"task_{len(self._task_history)}",
+                description=user_request,
+                steps=[]
+            )
 
         try:
-            print(f"\n🤔 [Manager] AI规划思考:\n{content[:500]}...")
-
-            # 提取JSON
-            json_str = self._extract_json(content)
-            plan_data = json.loads(json_str)
-
             need_dispatch = plan_data.get("need_dispatch", False)
             reason = plan_data.get("reason", "")
             print(f"\n📊 [Manager] 决策分析:")
@@ -263,7 +284,7 @@ class ManagerAgent(AgentBase):
             return task_plan
 
         except Exception as e:
-            print(f"\n⚠️ [Manager] 计划创建失败: {e}, 将直接处理")
+            print(f"\n⚠️ [Manager] 计划构建失败: {e}, 将直接处理")
             return TaskPlan(
                 task_id=f"task_{len(self._task_history)}",
                 description=user_request,
@@ -308,19 +329,27 @@ class ManagerAgent(AgentBase):
         print(f"\n✅ [Manager] 所有步骤执行完成")
 
     async def _execute_step(self, step: Dict, task_plan: TaskPlan):
-        """执行单个步骤"""
-        agent_name = step.get("agent_name")
+        """执行单个步骤（优先按 agent_id 查找，兜底按 agent_name 模糊匹配）"""
+        agent_id = step.get("agent_id")
+        agent_name = step.get("agent_name", "")
         task_description = step.get("task")
         task_input = step.get("input", "")
 
-        print(f"\n   📤 [Manager] 分派任务给 {agent_name}:")
+        print(f"\n   📤 [Manager] 分派任务给 {agent_name} (id={agent_id}):")
         print(f"      任务: {task_description[:50]}...")
 
-        # 获取Worker
-        worker = self._workers.get(agent_name)
+        # 优先按 UUID 查找
+        worker = self._workers.get(agent_id) if agent_id else None
+
+        # Fallback：按名称模糊匹配（兼容旧格式）
+        if not worker and agent_name:
+            for wid, w in self._workers.items():
+                if w.name == agent_name:
+                    worker = w
+                    break
 
         if not worker:
-            print(f"      ❌ Worker {agent_name} 未找到")
+            print(f"      ❌ Worker {agent_name}(id={agent_id}) 未找到")
             task_plan.results[step["step_id"]] = {
                 "status": "failed",
                 "error": f"Worker {agent_name} 未找到"
@@ -468,12 +497,19 @@ class ManagerAgent(AgentBase):
         return Msg(name=self.name, content=content, role="assistant")
 
     def _extract_json(self, text: str) -> str:
-        """从文本中提取JSON"""
-        # 尝试找到JSON块
+        """从文本中提取JSON，兼容 markdown 代码块和裸 JSON"""
+        # 优先处理 ```json ... ``` 代码块
+        import re
+        code_block = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text, re.DOTALL)
+        if code_block:
+            return code_block.group(1).strip()
+
+        # 找到最外层的 { } 对
         start = text.find("{")
         end = text.rfind("}")
-        if start != -1 and end != -1:
+        if start != -1 and end != -1 and end > start:
             return text[start:end+1]
+
         return text
 
     async def __call__(self, msg: Msg) -> Msg:
@@ -500,6 +536,7 @@ class WorkerAgent:
         tools: Optional[List[str]] = None,  # 该Worker可用的工具
         kb_id: Optional[str] = None,  # 关联的知识库ID
     ):
+        self.id = uuid.uuid4().hex[:8]  # 唯一 ID，供 Manager 字典键使用
         self.name = name
         self.role = role
         self.personality = personality
